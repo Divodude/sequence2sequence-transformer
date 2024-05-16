@@ -1,0 +1,318 @@
+import tensorflow as tf
+from tensorflow.keras.applications.vgg19 import VGG19, preprocess_input
+from tensorflow.keras.preprocessing import image
+from tensorflow.keras.models import Model
+import cv2
+import numpy as np
+import pandas as pd
+
+
+
+id=[]
+caption=[]
+data=pd.read_csv(r'E:\dwnlud\caption.xlsx')
+data['photoid']=id
+data['captions']=caption
+
+
+import tensorflow as tf
+import numpy as np
+import spacy
+
+# Load the SpaCy model
+nlp = spacy.load('en_core_web_sm')
+
+# Create a vocabulary dictionary using SpaCy's tokenizer
+vocab = {token.text: token.rank for token in nlp.vocab if token.has_vector or token.is_oov}
+vocab['<unk>'] = len(vocab)  # Add <unk> token for unknown words
+vocab['<start>'] = len(vocab) + 1  # Add <start> token for start of sequence
+
+# Define the padding token and its ID
+padding_token = '<pad>'
+padding_token_id = 0  # Commonly, 0 is used for padding
+
+# Add the padding token to the vocabulary
+vocab[padding_token] = padding_token_id
+def create_nested_tensor(tensors, mask):
+    return {'tensors': tensors, 'mask': mask}
+def position_embedding_sine(tensors, mask, num_pos_feats=64, temperature=10000, normalize=False, scale=None):
+    if scale is not None and normalize is False:
+        raise ValueError("normalize should be True if scale is passed")
+    if scale is None:
+        scale = 2 * np.pi
+    
+    not_mask = tf.cast(~mask, dtype=tf.float32)
+    y_embed = tf.cumsum(not_mask, axis=1)
+    x_embed = tf.cumsum(not_mask, axis=2)
+    
+    if normalize:
+        eps = 1e-6
+        y_embed = y_embed / (y_embed[:, -1:, :] + eps) * scale
+        x_embed = x_embed / (x_embed[:, :, -1:] + eps) * scale
+    
+    dim_t = tf.range(num_pos_feats, dtype=tf.float32)
+    dim_t = temperature ** (2 * (dim_t // 2) / num_pos_feats)
+    
+    pos_x = x_embed[:, :, :, None] / dim_t
+    pos_y = y_embed[:, :, :, None] / dim_t
+    pos_x = tf.stack([tf.sin(pos_x[:, :, :, 0::2]), tf.cos(pos_x[:, :, :, 1::2])], axis=4)
+    pos_x = tf.reshape(pos_x, [pos_x.shape[0], pos_x.shape[1], pos_x.shape[2], -1])
+    pos_y = tf.stack([tf.sin(pos_y[:, :, :, 0::2]), tf.cos(pos_y[:, :, :, 1::2])], axis=4)
+    pos_y = tf.reshape(pos_y, [pos_y.shape[0], pos_y.shape[1], pos_y.shape[2], -1])
+    pos = tf.concat([pos_y, pos_x], axis=3)
+    pos = tf.transpose(pos, perm=[0, 3, 1, 2])
+    
+    return pos
+def position_embedding_learned(tensors, num_pos_feats=256):
+    height, width = tensors.shape[-2], tensors.shape[-1]
+    row_embed = tf.Variable(tf.random.uniform([50, num_pos_feats]), trainable=True)
+    col_embed = tf.Variable(tf.random.uniform([50, num_pos_feats]), trainable=True)
+    
+    i = tf.range(width)
+    j = tf.range(height)
+    x_emb = tf.nn.embedding_lookup(col_embed, i)
+    y_emb = tf.nn.embedding_lookup(row_embed, j)
+    
+    pos = tf.concat([
+        tf.tile(x_emb[None, :, :], [height, 1, 1]),
+        tf.tile(y_emb[:, None, :], [1, width, 1]),
+    ], axis=-1)
+    pos = tf.transpose(pos, perm=[2, 0, 1])
+    pos = tf.expand_dims(pos, axis=0)
+    pos = tf.tile(pos, [tensors.shape[0], 1, 1, 1])
+    
+    return pos
+def preprocess_text(texts, vocab, max_len, start_token='<start>', pad_token='<pad>'):
+    start_token_id = vocab[start_token]
+    unk_token_id = vocab['<unk>']
+    pad_token_id = vocab[pad_token]
+    batch_size = len(texts)
+    tensor_list = np.full((batch_size, max_len), pad_token_id, dtype=np.int32)
+    mask_list = np.ones((batch_size, max_len), dtype=np.bool_)
+    
+    for i, text in enumerate(texts):
+        doc = nlp(text)
+        tokens = [start_token] + [token.text for token in doc]
+        token_ids = [vocab.get(token, unk_token_id) for token in tokens]
+        length = min(len(token_ids), max_len)
+        
+        tensor_list[i, :length] = token_ids[:length]
+        mask_list[i, :length] = False
+    
+    tensors = tf.convert_to_tensor(tensor_list, dtype=tf.int32)
+    mask = tf.convert_to_tensor(mask_list, dtype=tf.bool)
+    return create_nested_tensor(tensors, mask)
+def build_position_encoding(config):
+    N_steps = config['hidden_dim'] // 2
+    if config['position_embedding'] in ('v2', 'sine'):
+        position_embedding = lambda tensor_list: position_embedding_sine(
+            tensor_list['tensors'], tensor_list['mask'], N_steps, normalize=True
+        )
+    elif config['position_embedding'] in ('v3', 'learned'):
+        position_embedding = lambda tensor_list: position_embedding_learned(
+            tensor_list['tensors'], N_steps
+        )
+    else:
+        raise ValueError(f"not supported {config['position_embedding']}")
+    
+    return position_embedding
+
+max_len = 6 
+
+
+config = {
+    'hidden_dim': 128,
+    'position_embedding': 'sine'  # or 'learned'
+}
+
+
+captions_file_path = r"E:\dwnlud\flickr8k\captions.txt"
+
+
+data=pd.read_excel(r'E:\dwnlud\caption.xlsx')
+image=[]
+encoded=[]
+captions=data['captions']
+count=0
+for i in data['photoid']:
+    path=os.path.join(r'E:\dwnlud\flickr8k\images','',i)
+
+    np.append(cv2.imread(path),image)
+    count=count+1
+    print(count)
+    nested_tensor = preprocess_text(captions, vocab, max_len)
+    position_embedding_function = build_position_encoding(config)
+    positional_encoding = position_embedding_function(nested_tensor)
+    encoded=encoded.append(positional_encoding)
+dataset = tf.data.Dataset.zip((image, encoded))
+batch_size = 32
+dataset = dataset.batch(batch_size)
+
+print('done')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def feature_map(img, key):
+    base_model = VGG19(weights='imagenet', include_top=False)
+    layer = 'block4_conv2'
+    model = Model(inputs=base_model.input, outputs=base_model.get_layer(layer).output)
+    img = preprocess_input(img)
+    img = np.expand_dims(img, axis=0)
+    return model.predict(img), key
+
+    
+
+
+
+
+
+def dot_product_attention(Q, K, V):
+    dot_products = np.dot(Q, K.T)
+    attention_weights = np.exp(dot_products) / np.sum(np.exp(dot_products), axis=1, keepdims=True)
+    attention_output = np.dot(attention_weights, V)   
+    return attention_weights, attention_output
+
+
+def multi_head_attention(v, k, q, mask):
+    d_model = tf.shape(q)[-1]
+    num_heads = 8
+    assert d_model % num_heads == 0
+    depth = d_model // num_heads
+    wq = tf.keras.layers.Dense(d_model)
+    wk = tf.keras.layers.Dense(d_model)
+    wv = tf.keras.layers.Dense(d_model)
+    dense = tf.keras.layers.Dense(d_model)
+    def split_heads(x, batch_size):
+        x = tf.reshape(x, (batch_size, -1, num_heads, depth))
+        return tf.transpose(x, perm=[0, 2, 1, 3])
+        
+    batch_size = tf.shape(q)[0]
+    
+    q = wq(q)
+    k = wk(k)
+    v = wv(v)
+    
+    q = split_heads(q, batch_size)
+    k = split_heads(k, batch_size)
+    v = split_heads(v, batch_size)
+    
+    matmul_qk = tf.matmul(q, k, transpose_b=True)
+    
+    dk = tf.cast(tf.shape(k)[-1], tf.float32)
+    scaled_attention_logits = matmul_qk / tf.math.sqrt(dk)
+    
+    if mask is not None:
+        scaled_attention_logits += (mask * -1e9)
+    
+    attention_weights = tf.nn.softmax(scaled_attention_logits, axis=-1)
+    
+    output = tf.matmul(attention_weights, v)
+    output = tf.transpose(output, perm=[0, 2, 1, 3])
+    output = tf.reshape(output, (batch_size, -1, d_model))
+    
+    output = dense(output)
+    
+    return output, attention_weights
+
+
+
+
+def encoder(inputs, mask):
+    inputs=cv2.imread(inputs)
+    d_model = tf.shape(inputs)[-1]
+    num_heads = 8
+    dff = 2048
+    mha_output, _ = multi_head_attention(inputs, inputs, inputs, mask)
+    mha_output = tf.keras.layers.LayerNormalization(epsilon=1e-6)(inputs + mha_output)
+    
+    ffn_output = tf.keras.Sequential([
+        tf.keras.layers.Dense(dff, activation='relu'),
+        tf.keras.layers.Dense(d_model)
+    ])(mha_output)
+    ffn_output = tf.keras.layers.Dropout(0.1)(ffn_output)
+    ffn_output = tf.keras.layers.LayerNormalization(epsilon=1e-6)(mha_output + ffn_output)
+    
+    return ffn_output
+
+
+def decoder(inputs, encoder_output, look_ahead_mask, padding_mask):
+    d_model = tf.shape(inputs)[-1]
+    num_heads = 8
+    dff = 2048
+    
+    # Masked multi-head attention layer for the decoder's self-attention
+    self_attention_output, _ = multi_head_attention(inputs, inputs, inputs, look_ahead_mask)
+    self_attention_output = tf.keras.layers.LayerNormalization(epsilon=1e-6)(inputs + self_attention_output)
+    
+    # Multi-head attention layer to attend to encoder's output
+    attention_output, _ = multi_head_attention(encoder_output, encoder_output, self_attention_output, padding_mask)
+    attention_output = tf.keras.layers.Dropout(0.1)(attention_output)
+    attention_output = tf.keras.layers.LayerNormalization(epsilon=1e-6)(self_attention_output + attention_output)
+    
+    # Position-wise feed-forward network
+    ffn_output = tf.keras.Sequential([ 
+        tf.keras.layers.Dense(dff, activation='relu'),
+        tf.keras.layers.Dense(d_model)
+    ])(attention_output)
+    ffn_output = tf.keras.layers.Dropout(0.1)(ffn_output)
+    decoder_output = tf.keras.layers.LayerNormalization(epsilon=1e-6)(attention_output + ffn_output)
+    
+    return decoder_output
+
+
+def create_look_ahead_mask(size):
+    mask = 1 - tf.linalg.band_part(tf.ones((size, size)), -1, 0)
+    return mask
+
+def create_padding_mask(seq):
+    mask = tf.cast(tf.math.equal(seq, 0), tf.float32)
+    return mask[:, tf.newaxis, tf.newaxis, :]
+
+def loss_function(real, pred):
+    loss_object = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction='none')
+    loss = loss_object(real, pred)
+    return loss
+
+optimizer = tf.keras.optimizers.Adam()
+
+num_epochs = 50  
+for epoch in range(num_epochs):
+    for batch_images,batch_captions in dataset:
+        with tf.GradientTape() as tape:
+            encoder_output = encoder(batch_images)
+            decoder_input = tf.fill((batch_captions.shape[0], 1), '<start>')
+            
+            total_loss = 0
+            for t in range(1, max_caption_length=40):
+                look_ahead_mask = create_look_ahead_mask(tf.shape(decoder_input)[1])
+                padding_mask = create_padding_mask(batch_images)
+                
+                predictions, _ = decoder(decoder_input, encoder_output, look_ahead_mask, padding_mask)
+                
+                loss = loss_function(batch_captions[:, t], predictions)
+                
+                mask = tf.math.logical_not(tf.math.equal(batch_captions[:, t],'0'))
+                mask = tf.cast(mask, dtype=loss.dtype)
+                loss *= mask
+                
+                total_loss += tf.reduce_sum(loss) / tf.reduce_sum(mask)
+                
+                decoder_input = tf.concat([decoder_input, tf.expand_dims(batch_captions[:, t], 1)], axis=-1)
+            
+            gradients = tape.gradient(total_loss, encoder.trainable_variables + decoder.trainable_variables)
+            optimizer.apply_gradients(zip(gradients, encoder.trainable_variables + decoder.trainable.variables))
+
+
+
